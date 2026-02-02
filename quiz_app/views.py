@@ -2,6 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from bson import ObjectId
 from bson.errors import InvalidId
+from django.core.cache import cache
 
 from .mongo import quiz_collection, question_collection
 from .llm_service import generate_upsc_question
@@ -22,9 +23,9 @@ class StartQuizAPIView(APIView):
             return Response({"error": error}, status=400)
 
         quiz = {
-            "exam_type": exam_type,        # ✅ store exam type
+            "exam_type": exam_type,
             "topic": topic,
-            "total_questions": 3,          # ✅ backend fixed
+            "total_questions": 3,      # backend-controlled
             "current_question": 0,
             "correct_count": 0
         }
@@ -57,14 +58,14 @@ class GenerateQuestionAPIView(APIView):
         if not quiz:
             return Response({"error": "Quiz not found"}, status=404)
 
-        # 2️⃣ Calculate next question number
+        # 2️⃣ Next question number
         q_no = quiz.get("current_question", 0) + 1
 
-        # 3️⃣ HARD STOP after total questions
+        # 3️⃣ Stop after total questions
         if q_no > quiz["total_questions"]:
             return Response({"message": "Quiz completed"})
 
-        # 4️⃣ Check if question already exists (prevents duplicates)
+        # 4️⃣ Prevent duplicate DB questions
         existing_question = question_collection.find_one({
             "quiz_id": quiz_id,
             "question_no": q_no
@@ -78,12 +79,32 @@ class GenerateQuestionAPIView(APIView):
                 "options": existing_question["options"]
             })
 
-        # 5️⃣ Generate new question using LLM
-        llm_data = generate_upsc_question(
-            quiz.get("exam_type", "UPSC"),
-            quiz["topic"]
-        )
+        # 5️⃣ Redis + LLM logic
+        exam_type = quiz.get("exam_type", "UPSC")
+        topic = quiz["topic"]
 
+        cache_key = f"quiz:{exam_type}:{topic}:q{q_no}"
+
+        # 🔍 Redis check
+        llm_data = cache.get(cache_key)
+
+        # ✅ ADD THIS PART HERE
+        if llm_data:
+            print("✅ REDIS HIT:", cache_key)
+        else:
+            print("❌ REDIS MISS:", cache_key)
+            llm_data = generate_upsc_question(exam_type, topic)
+            cache.set(cache_key, llm_data, timeout=3600)
+
+
+        if not llm_data:
+            # Cache MISS → call LLM
+            llm_data = generate_upsc_question(exam_type, topic)
+
+            # Store in Redis (TTL = 1 hour)
+            cache.set(cache_key, llm_data, timeout=3600)
+
+        # 6️⃣ Store question in MongoDB
         question = {
             "quiz_id": quiz_id,
             "question_no": q_no,
@@ -102,6 +123,10 @@ class GenerateQuestionAPIView(APIView):
             "question": question["question"],
             "options": question["options"]
         })
+        if llm_data:
+            print("✅ REDIS HIT:", cache_key)
+        else:
+            print("❌ REDIS MISS:", cache_key)
 
 
 # =======================
@@ -171,7 +196,6 @@ class SubmitAnswerAPIView(APIView):
 # =======================
 class QuizSummaryAPIView(APIView):
     def get(self, request, quiz_id):
-
         try:
             quiz = quiz_collection.find_one({"_id": ObjectId(quiz_id)})
         except InvalidId:
