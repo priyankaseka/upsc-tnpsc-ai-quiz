@@ -10,23 +10,47 @@ from .validators import validate_topic, validate_answer
 
 
 # =======================
+# LANGUAGE DETECTION
+# =======================
+def detect_language_from_text(text: str) -> str:
+    """
+    Detect Tamil language using Unicode range.
+    Returns 'ta' for Tamil, 'en' for English.
+    """
+    for ch in text:
+        if '\u0B80' <= ch <= '\u0BFF':
+            return "ta"
+    return "en"
+
+
+def decide_language(exam_type: str, topic: str) -> str:
+    """
+    Centralized language decision.
+    User has NO control over language.
+    """
+    if exam_type.upper() == "UPSC":
+        return "en"
+    elif exam_type.upper() == "TNPSC":
+        return detect_language_from_text(topic)
+    return "en"
+
+
+# =======================
 # START QUIZ
 # =======================
 class StartQuizAPIView(APIView):
     def post(self, request):
         topic = request.data.get("topic")
-        exam_type = request.data.get("exam_type", "UPSC")  # UPSC / TNPSC
+        exam_type = request.data.get("exam_type", "UPSC")
 
-        # Validate topic
         valid, error = validate_topic(topic)
         if not valid:
             return Response({"error": error}, status=400)
 
         quiz = {
-            "exam_type": exam_type,
+            "exam_type": exam_type.upper(),
             "topic": topic,
-            "total_questions": 3,      # backend-controlled
-            "current_question": 0,
+            "total_questions": 3,   # change to 25 if needed
             "correct_count": 0
         }
 
@@ -34,99 +58,109 @@ class StartQuizAPIView(APIView):
 
         return Response({
             "quiz_id": str(quiz_id),
-            "exam_type": exam_type,
+            "exam_type": exam_type.upper(),
             "message": "Quiz started"
         })
 
 
 # =======================
-# GENERATE QUESTION
+# GENERATE ALL QUESTIONS
 # =======================
-class GenerateQuestionAPIView(APIView):
+class GenerateAllQuestionsAPIView(APIView):
     def post(self, request):
         quiz_id = request.data.get("quiz_id")
 
-        # 1️⃣ quiz_id validation
         if not quiz_id:
             return Response({"error": "quiz_id is required"}, status=400)
 
         try:
-            quiz = quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            quiz_obj_id = ObjectId(quiz_id)
+            quiz = quiz_collection.find_one({"_id": quiz_obj_id})
         except InvalidId:
-            return Response({"error": "Invalid quiz_id format"}, status=400)
+            return Response({"error": "Invalid quiz_id"}, status=400)
 
         if not quiz:
             return Response({"error": "Quiz not found"}, status=404)
 
-        # 2️⃣ Next question number
-        q_no = quiz.get("current_question", 0) + 1
+        exam_type = quiz["exam_type"]
+        topic = quiz["topic"]
+        total = quiz["total_questions"]
 
-        # 3️⃣ Stop after total questions
-        if q_no > quiz["total_questions"]:
-            return Response({"message": "Quiz completed"})
+        # 🔐 LANGUAGE LOCK (USER CANNOT CONTROL)
+        language = decide_language(exam_type, topic)
 
-        # 4️⃣ Prevent duplicate DB questions
-        existing_question = question_collection.find_one({
-            "quiz_id": quiz_id,
-            "question_no": q_no
-        })
+        response_questions = []
 
-        if existing_question:
-            return Response({
-                "question_id": str(existing_question["_id"]),
-                "question_no": existing_question["question_no"],
-                "question": existing_question["question"],
-                "options": existing_question["options"]
+        for q_no in range(1, total + 1):
+
+            # Check if already generated for this quiz
+            existing = question_collection.find_one({
+                "quiz_id": quiz_obj_id,
+                "question_no": q_no
             })
 
-        # 5️⃣ Redis + LLM logic
-        exam_type = quiz.get("exam_type", "UPSC")
-        topic = quiz["topic"]
+            if existing:
+                response_questions.append({
+                    "question_id": str(existing["_id"]),
+                    "question_no": q_no,
+                    "question": existing["question"],
+                    "options": existing["options"]
+                })
+                continue
 
-        cache_key = f"quiz:{exam_type}:{topic}:q{q_no}"
+            # 🔑 TOPIC-BASED CACHE KEY (REDIS HIT FOR SAME TOPIC)
+            safe_topic = topic.strip().lower()
+            cache_key = f"topic:{exam_type}:{language}:{safe_topic}:q{q_no}"
 
-        # 🔍 Redis check
-        llm_data = cache.get(cache_key)
+            llm_data = cache.get(cache_key)
 
-        # ✅ ADD THIS PART HERE
-        if llm_data:
-            print("✅ REDIS HIT:", cache_key)
-        else:
-            print("❌ REDIS MISS:", cache_key)
-            llm_data = generate_upsc_question(exam_type, topic)
-            cache.set(cache_key, llm_data, timeout=3600)
+            if llm_data:
+                print(f"✅ REDIS HIT → {cache_key}")
+            else:
+                print(f"❌ REDIS MISS → {cache_key}")
+                llm_data = generate_upsc_question(
+                    exam_type=exam_type,
+                    topic=topic,
+                    language=language
+                )
 
+                if not llm_data:
+                    return Response(
+                        {"error": "Question generation failed. Please retry."},
+                        status=500
+                    )
 
-        if not llm_data:
-            # Cache MISS → call LLM
-            llm_data = generate_upsc_question(exam_type, topic)
+                # 🚨 UPSC language safety (English only)
+                if exam_type == "UPSC":
+                    if detect_language_from_text(llm_data["question"]) != "en":
+                        return Response(
+                            {"error": "Language violation detected. Retry required."},
+                            status=500
+                        )
 
-            # Store in Redis (TTL = 1 hour)
-            cache.set(cache_key, llm_data, timeout=3600)
+                cache.set(cache_key, llm_data, timeout=3600)
 
-        # 6️⃣ Store question in MongoDB
-        question = {
-            "quiz_id": quiz_id,
-            "question_no": q_no,
-            "question": llm_data["question"],
-            "options": llm_data["options"],
-            "correct_answer": llm_data["correct_answer"],
-            "explanation": llm_data["explanation"],
-            "answered": False
-        }
+            # Save question for this quiz
+            question = {
+                "quiz_id": quiz_obj_id,
+                "question_no": q_no,
+                "question": llm_data["question"],
+                "options": llm_data["options"],
+                "correct_answer": llm_data["correct_answer"],
+                "explanation": llm_data["explanation"],
+                "answered": False
+            }
 
-        q_id = question_collection.insert_one(question).inserted_id
+            q_id = question_collection.insert_one(question).inserted_id
 
-        return Response({
-            "question_id": str(q_id),
-            "question_no": q_no,
-            "question": question["question"],
-            "options": question["options"]
-        })
-        if llm_data:
-            print("✅ REDIS HIT:", cache_key)
-        else:
-            print("❌ REDIS MISS:", cache_key)
+            response_questions.append({
+                "question_id": str(q_id),
+                "question_no": q_no,
+                "question": question["question"],
+                "options": question["options"]
+            })
+
+        return Response({"questions": response_questions})
 
 
 # =======================
@@ -137,52 +171,43 @@ class SubmitAnswerAPIView(APIView):
         question_id = request.data.get("question_id")
         user_answer = request.data.get("user_answer")
 
-        # Validate answer
         valid, error = validate_answer(user_answer)
         if not valid:
             return Response({"error": error}, status=400)
 
-        if not question_id:
-            return Response({"error": "question_id is required"}, status=400)
-
         try:
-            question = question_collection.find_one({"_id": ObjectId(question_id)})
+            question_obj_id = ObjectId(question_id)
+            question = question_collection.find_one({"_id": question_obj_id})
         except InvalidId:
-            return Response({"error": "Invalid question_id format"}, status=400)
+            return Response({"error": "Invalid question_id"}, status=400)
 
         if not question:
             return Response({"error": "Question not found"}, status=404)
 
-        # Already answered
         if question["answered"]:
             return Response({
                 "message": "Already answered",
-                "user_answer": question.get("user_answer"),
+                "is_correct": question["is_correct"],
                 "correct_answer": question["correct_answer"],
-                "is_correct": question.get("is_correct"),
                 "explanation": question["explanation"]
             })
 
         is_correct = user_answer == question["correct_answer"]
 
-        # Update question
         question_collection.update_one(
-            {"_id": ObjectId(question_id)},
+            {"_id": question_obj_id},
             {"$set": {
+                "answered": True,
                 "user_answer": user_answer,
-                "is_correct": is_correct,
-                "answered": True
+                "is_correct": is_correct
             }}
         )
 
-        # Update quiz stats
-        quiz_collection.update_one(
-            {"_id": ObjectId(question["quiz_id"])},
-            {"$inc": {
-                "current_question": 1,
-                "correct_count": 1 if is_correct else 0
-            }}
-        )
+        if is_correct:
+            quiz_collection.update_one(
+                {"_id": question["quiz_id"]},
+                {"$inc": {"correct_count": 1}}
+            )
 
         return Response({
             "is_correct": is_correct,
@@ -192,25 +217,39 @@ class SubmitAnswerAPIView(APIView):
 
 
 # =======================
-# FINAL SUMMARY
+# QUIZ SUMMARY
 # =======================
 class QuizSummaryAPIView(APIView):
     def get(self, request, quiz_id):
         try:
-            quiz = quiz_collection.find_one({"_id": ObjectId(quiz_id)})
+            quiz_obj_id = ObjectId(quiz_id)
+            quiz = quiz_collection.find_one({"_id": quiz_obj_id})
         except InvalidId:
-            return Response({"error": "Invalid quiz_id format"}, status=400)
+            return Response({"error": "Invalid quiz_id"}, status=400)
 
         if not quiz:
             return Response({"error": "Quiz not found"}, status=404)
 
         total = quiz["total_questions"]
+
+        answered_count = question_collection.count_documents({
+            "quiz_id": quiz_obj_id,
+            "answered": True
+        })
+
+        if answered_count < total:
+            return Response({
+                "error": "All questions must be answered before viewing summary",
+                "answered": answered_count,
+                "total": total
+            }, status=400)
+
         correct = quiz["correct_count"]
         wrong = total - correct
         percentage = round((correct / total) * 100, 2)
 
         return Response({
-            "exam_type": quiz.get("exam_type", "UPSC"),
+            "exam_type": quiz["exam_type"],
             "total_questions": total,
             "correct_questions": correct,
             "wrong_questions": wrong,
