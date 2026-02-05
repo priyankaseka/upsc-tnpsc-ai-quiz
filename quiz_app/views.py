@@ -215,8 +215,6 @@ class QuizSummaryAPIView(APIView):
             }, status=400)
 
         percentage = round((correct / total) * 100, 2)
-
-        # ✅ STORE SUMMARY FOR ADMIN
         summary_collection.update_one(
             {"quiz_id": quiz_obj_id},
             {"$set": {
