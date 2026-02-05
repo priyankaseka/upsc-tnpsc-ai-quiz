@@ -1,5 +1,6 @@
 from groq import Groq
 from django.conf import settings
+from django.core.cache import cache
 import json
 import re
 
@@ -14,7 +15,7 @@ client = Groq(api_key=settings.GROQ_API_KEY)
 # =======================
 def safe_json_parse(text: str):
     """
-    Safely extract and parse JSON from LLM output.
+    Extract and parse JSON safely from LLM output.
     Handles extra text or malformed responses.
     """
     try:
@@ -28,24 +29,39 @@ def safe_json_parse(text: str):
                 return None
         return None
 
+
+# =======================
+# UPSC QUALITY FILTER
+# =======================
 def is_upsc_too_factual(question: str) -> bool:
     """
     Reject school-level or direct factual UPSC questions.
     """
     banned_phrases = [
         "is located",
-        "is known as",
-        "which country",
-        "which of the following is",
+        "is defined as",
         "refers to",
-        "is defined as"
+        "means",
+        "which country"
     ]
     q = question.lower()
     return any(p in q for p in banned_phrases)
 
+
+# =======================
+# CACHE KEY BUILDER
+# =======================
+def build_cache_key(exam_type: str, language: str, topic: str) -> str:
+    return f"quiz:{exam_type}:{language}:{topic.strip().lower()}"
+
+
+# =======================
+# MAIN QUESTION GENERATOR
+# =======================
 def generate_upsc_question(exam_type, topic, language="en"):
     """
     Generate ONE MCQ based on UPSC / TNPSC rules.
+    Uses Redis cache to avoid repeated LLM calls.
     Returns dict or None.
     """
 
@@ -55,8 +71,22 @@ def generate_upsc_question(exam_type, topic, language="en"):
     if exam_type == "UPSC":
         language = "en"
 
+    # =======================
+    # 🔑 REDIS CACHE CHECK
+    # =======================
+    cache_key = build_cache_key(exam_type, language, topic)
+    cached_data = cache.get(cache_key)
 
-    prompt = f"""
+    if cached_data:
+        print("✅ Redis HIT → LLM not called")
+        return cached_data
+
+    print("❌ Redis MISS → Calling LLM")
+
+    # =======================
+    # PRIMARY STRICT PROMPT
+    # =======================
+    strict_prompt = f"""
 You are a senior examiner who sets questions for Indian competitive examinations.
 
 Generate EXACTLY ONE high-quality multiple-choice question
@@ -70,7 +100,7 @@ LANGUAGE: {language}
 
 GLOBAL RULES:
 - Output ONLY valid JSON
-- Do NOT add any text outside JSON
+- No text outside JSON
 - Exactly 4 options: A, B, C, D
 - Only ONE correct answer
 - correct_answer must be A, B, C, or D
@@ -82,28 +112,23 @@ UPSC RULES (APPLY ONLY IF EXAM TYPE = UPSC):
 - Language MUST be English
 - Difficulty MUST match UPSC Prelims PYQ standard
 - Question MUST test conceptual understanding or elimination
-- Do NOT ask direct factual or location-based questions
-- Do NOT ask “which case introduced…” questions
-- Avoid list-based and memory-based questions
+- Avoid direct factual or location-based questions
+- Avoid “which case introduced…” questions
 - Prefer:
-  • Statement-based questions
-  • Assertion–Reason questions
+  • Statement-based
+  • Assertion–Reason
   • Conceptual elimination questions
 
 ------------------------------------------------
 TNPSC RULES (APPLY ONLY IF EXAM TYPE = TNPSC):
 
 - Language must follow the topic naturally
-  (Tamil topic → Tamil, English topic → English)
 - Tamil Nadu relevance is mandatory
 - Difficulty: TNPSC Group I / II standard
-- Prefer:
-  • Chronology
-  • Scheme–objective matching
-  • Tamil Nadu administration, polity, history, geography
+- Prefer chronology and scheme–objective matching
 
 ------------------------------------------------
-JSON OUTPUT FORMAT (STRICT):
+JSON OUTPUT FORMAT:
 {{
   "question": "",
   "options": {{
@@ -115,19 +140,48 @@ JSON OUTPUT FORMAT (STRICT):
   "correct_answer": "",
   "explanation": ""
 }}
+"""
 
-IMPORTANT:
-- Explanation must clearly justify why the correct option is correct
-- Do NOT mention the exam name in the question
+    # =======================
+    # FALLBACK PROMPT
+    # =======================
+    fallback_prompt = f"""
+Generate ONE conceptual multiple-choice question in English.
+
+RULES:
+- No direct factual recall
+- No locations
+- No definitions
+- Use reasoning or elimination
+- Output ONLY valid JSON
+- Exactly 4 options A, B, C, D
+
+TOPIC:
+{topic}
+
+JSON FORMAT:
+{{
+  "question": "",
+  "options": {{
+    "A": "",
+    "B": "",
+    "C": "",
+    "D": ""
+  }},
+  "correct_answer": "",
+  "explanation": ""
+}}
 """
 
     # =======================
     # RETRY LOGIC
     # =======================
-    max_attempts = 4 if exam_type == "UPSC" else 2
+    max_attempts = 3 if exam_type == "UPSC" else 2
 
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts + 1):
         try:
+            prompt = strict_prompt if attempt < max_attempts else fallback_prompt
+
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
@@ -139,33 +193,31 @@ IMPORTANT:
             parsed = safe_json_parse(content)
 
             # -----------------------
-            # BASIC VALIDATION
+            # VALIDATION GATE
             # -----------------------
             if not parsed or not isinstance(parsed, dict):
                 continue
 
-            if "question" not in parsed or "options" not in parsed:
+            if not {"question", "options", "correct_answer", "explanation"} <= parsed.keys():
                 continue
 
-            # TNPSC-TOLERANT OPTION CHECK
-            if not set(parsed["options"].keys()).issuperset({"A", "B", "C", "D"}):
+            if not {"A", "B", "C", "D"} <= set(parsed["options"].keys()):
                 continue
 
-            if parsed.get("correct_answer") not in {"A", "B", "C", "D"}:
+            if parsed["correct_answer"] not in {"A", "B", "C", "D"}:
                 continue
 
-            if "explanation" not in parsed:
+            if exam_type == "UPSC" and is_upsc_too_factual(parsed["question"]):
                 continue
 
-            # UPSC QUALITY FILTER (ONLY FOR UPSC)
-            if exam_type == "UPSC":
-                if is_upsc_too_factual(parsed["question"]):
-                    continue
+            # =======================
+            # ✅ SAVE TO REDIS
+            # =======================
+            cache.set(cache_key, parsed, timeout=60 * 60 * 24)  # 24 hours
 
             return parsed
 
         except Exception:
             continue
 
-    # All attempts failed
     return None
