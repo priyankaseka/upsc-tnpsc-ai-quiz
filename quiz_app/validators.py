@@ -7,11 +7,9 @@ TA_VOWELS = set("அஆஇஈஉஊஎஏஐஒஓஔ")
 def is_meaningful_word(word: str) -> bool:
     word = word.strip().lower()
 
-    # English word check
     if re.fullmatch(r"[a-z]+", word):
         return len(word) >= 4 and any(ch in EN_VOWELS for ch in word)
 
-    # Tamil word check
     if re.search(r"[\u0B80-\u0BFF]", word):
         return len(word) >= 4 and any(ch in TA_VOWELS for ch in word)
 
