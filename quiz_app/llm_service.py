@@ -4,15 +4,8 @@ from django.core.cache import cache
 import json
 import re
 
-# =======================
-# GROQ CLIENT
-# =======================
 client = Groq(api_key=settings.GROQ_API_KEY)
 
-
-# =======================
-# SAFE JSON PARSER
-# =======================
 def safe_json_parse(text: str):
     """
     Extract and parse JSON safely from LLM output.
@@ -30,9 +23,6 @@ def safe_json_parse(text: str):
         return None
 
 
-# =======================
-# UPSC QUALITY FILTER
-# =======================
 def is_upsc_too_factual(question: str) -> bool:
     """
     Reject school-level or direct factual UPSC questions.
@@ -48,16 +38,9 @@ def is_upsc_too_factual(question: str) -> bool:
     return any(p in q for p in banned_phrases)
 
 
-# =======================
-# CACHE KEY BUILDER
-# =======================
 def build_cache_key(exam_type: str, language: str, topic: str) -> str:
     return f"quiz:{exam_type}:{language}:{topic.strip().lower()}"
 
-
-# =======================
-# MAIN QUESTION GENERATOR
-# =======================
 def generate_upsc_question(exam_type, topic, language="en"):
     """
     Generate ONE MCQ based on UPSC / TNPSC rules.
@@ -71,9 +54,6 @@ def generate_upsc_question(exam_type, topic, language="en"):
     if exam_type == "UPSC":
         language = "en"
 
-    # =======================
-    # 🔑 REDIS CACHE CHECK
-    # =======================
     cache_key = build_cache_key(exam_type, language, topic)
     cached_data = cache.get(cache_key)
 
@@ -83,9 +63,6 @@ def generate_upsc_question(exam_type, topic, language="en"):
 
     print("❌ Redis MISS → Calling LLM")
 
-    # =======================
-    # PRIMARY STRICT PROMPT
-    # =======================
     strict_prompt = f"""
 You are a senior examiner who sets questions for Indian competitive examinations.
 
@@ -142,9 +119,6 @@ JSON OUTPUT FORMAT:
 }}
 """
 
-    # =======================
-    # FALLBACK PROMPT
-    # =======================
     fallback_prompt = f"""
 Generate ONE conceptual multiple-choice question in English.
 
@@ -172,10 +146,6 @@ JSON FORMAT:
   "explanation": ""
 }}
 """
-
-    # =======================
-    # RETRY LOGIC
-    # =======================
     max_attempts = 3 if exam_type == "UPSC" else 2
 
     for attempt in range(max_attempts + 1):
@@ -192,9 +162,6 @@ JSON FORMAT:
             content = response.choices[0].message.content.strip()
             parsed = safe_json_parse(content)
 
-            # -----------------------
-            # VALIDATION GATE
-            # -----------------------
             if not parsed or not isinstance(parsed, dict):
                 continue
 
@@ -210,10 +177,7 @@ JSON FORMAT:
             if exam_type == "UPSC" and is_upsc_too_factual(parsed["question"]):
                 continue
 
-            # =======================
-            # ✅ SAVE TO REDIS
-            # =======================
-            cache.set(cache_key, parsed, timeout=60 * 60 * 24)  # 24 hours
+            cache.set(cache_key, parsed, timeout=None)  
 
             return parsed
 

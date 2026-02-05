@@ -8,9 +8,6 @@ from .llm_service import generate_upsc_question
 from .validators import validate_topic, validate_answer
 
 
-# =======================
-# LANGUAGE DETECTION
-# =======================
 def detect_language_from_text(text: str) -> str:
     for ch in text:
         if '\u0B80' <= ch <= '\u0BFF':
@@ -26,9 +23,6 @@ def decide_language(exam_type: str, topic: str) -> str:
     return "en"
 
 
-# =======================
-# START QUIZ
-# =======================
 class StartQuizAPIView(APIView):
     def post(self, request):
         topic = request.data.get("topic")
@@ -55,10 +49,6 @@ class StartQuizAPIView(APIView):
             "message": "Quiz started"
         })
 
-
-# =======================
-# GENERATE QUESTIONS
-# =======================
 class GenerateAllQuestionsAPIView(APIView):
     def post(self, request):
         quiz_id = request.data.get("quiz_id")
@@ -135,10 +125,6 @@ class GenerateAllQuestionsAPIView(APIView):
             ]
         })
 
-
-# =======================
-# SUBMIT ANSWER
-# =======================
 class SubmitAnswerAPIView(APIView):
     def post(self, request):
         quiz_id = request.data.get("quiz_id")
@@ -206,10 +192,6 @@ class SubmitAnswerAPIView(APIView):
             "explanation": question["explanation"]
         })
 
-
-# =======================
-# QUIZ SUMMARY (STORED IN DB)
-# =======================
 class QuizSummaryAPIView(APIView):
     def get(self, request, quiz_id):
         try:
